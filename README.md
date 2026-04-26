@@ -30,7 +30,7 @@ ghcr.io/chefcai/audiobookshelf-alpine:<upstream-tag>   # e.g., v2.33.2
 | | Size | Δ vs upstream |
 |---|---:|---:|
 | `ghcr.io/advplyr/audiobookshelf:latest` (upstream) | **320 MB** | — |
-| `ghcr.io/chefcai/audiobookshelf-alpine:latest` (iter 2) | _measuring…_ | _measuring…_ |
+| `ghcr.io/chefcai/audiobookshelf-alpine:latest` (iter 3) | **249 MB** | **−71 MB (−22.2 %)** |
 
 (Sizes here are reported uncompressed by `docker images` — i.e., what the
 image occupies on the host's filesystem after pull. The CI workflow logs
@@ -76,7 +76,8 @@ none of the build-time weight or non-target arch binaries.
 | 1 | multi-stage + prod-only re-install + alpine runtime + native/cruft prune | **252 MB** | **−68 MB** | **−68 MB (−21.3 %)** |
 | 2a | _attempted_ strip ffmpeg video-codec libs + HW-accel stubs | _broke ffmpeg_ | — | — |
 | 2 | combine apk-add+prune into single RUN; drop man/doc/locale | **251 MB** | **−1 MB** | **−69 MB (−21.6 %)** |
-| 3 | drop build-only `node-gyp` + `node-addon-api` from prod node_modules | _measuring…_ | _measuring…_ | _measuring…_ |
+| 3 | drop build-only `node-gyp` + `node-addon-api` from prod node_modules | **249 MB** | **−2 MB** | **−71 MB (−22.2 %)** |
+| — | _plateau_ — remaining ~249 MB is dominated by stripped node binary (62 MB) + ffmpeg's NEEDED ELF deps (~85 MB), neither further reducible without a custom ffmpeg build. | | | |
 
 (The iteration log is updated in-place with each commit. Each row corresponds
 to one Dockerfile change pushed to `main`; the size column is the uncompressed
