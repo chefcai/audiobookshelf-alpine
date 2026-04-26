@@ -74,7 +74,8 @@ none of the build-time weight or non-target arch binaries.
 |---:|---|---:|---:|---:|
 | 0 | upstream `ghcr.io/advplyr/audiobookshelf:latest` | 320 MB | — | — |
 | 1 | multi-stage + prod-only re-install + alpine runtime + native/cruft prune | **252 MB** | **−68 MB** | **−68 MB (−21.3 %)** |
-| 2 | strip ffmpeg video-codec libs + HW-accel stubs (audio-only runtime) | _measuring…_ | _measuring…_ | _measuring…_ |
+| 2a | _attempted_ strip ffmpeg video-codec libs + HW-accel stubs | _broke ffmpeg_ | — | — |
+| 2 | combine apk-add+prune into single RUN; drop man/doc/locale | _measuring…_ | _measuring…_ | _measuring…_ |
 
 (The iteration log is updated in-place with each commit. Each row corresponds
 to one Dockerfile change pushed to `main`; the size column is the uncompressed
@@ -98,32 +99,62 @@ The 21 % shave from this iter alone covers the headroom most easily attacked
 without runtime smoke-testing. ffmpeg slimming is the next big lever and gets
 its own iter so the diff is bisectable if anything regresses.
 
-### Iter 2 — strip ffmpeg video-codec libs + HW-accel stubs
+### Iter 2a — _failed_ — strip ffmpeg video-codec libs + HW-accel stubs
 
-Audiobookshelf only ever transcodes audio (HLS audio streaming, cover-art
-extraction, chapter timing). Apk's `ffmpeg` package pulls in a lot of video
-codec providers via shared deps that the audio runtime never invokes:
+**Hypothesis (incorrect):** apk's `ffmpeg` pulls ~44 MB of video codec
+providers (`libx265` 18.8 MB, `libaom` 7.4 MB, `libSvtAv1Enc` 6.5 MB,
+`libvpx` 3.2 MB, `libx264`, `librav1e`, `libdav1d`, `libtheora*`,
+`libpostproc`, plus `libvulkan` + `libdrm*` + `libva*` HW-accel stubs)
+which the libav* core libraries dlopen on demand. An audio-only ABS
+runtime should never trigger those code paths, so removing the `.so`
+files should be safe.
 
-| Library | Size | Purpose | Audio-only need? |
-|---|---:|---|---|
-| `libx265.so` | 18.8 MB | H.265 video encoder | No |
-| `libaom.so` | 7.4 MB | AV1 video encoder | No |
-| `libSvtAv1Enc.so` | 6.5 MB | AV1 video encoder | No |
-| `libvpx.so` | 3.2 MB | VP8/VP9 video encoder | No |
-| `libx264.so` | 2.2 MB | H.264 video encoder | No |
-| `librav1e.so` | 2.2 MB | AV1 video encoder | No |
-| `libdav1d.so` | 1.6 MB | AV1 video decoder | No |
-| `libtheora*.so` | 0.6 MB | Theora video codec | No |
-| `libpostproc.so` | 84 KB | Video post-processing | No |
-| `libvulkan.so` + `libdrm*.so` + `libva*.so` | ~1.4 MB | Hardware accel | No (no `--device` passthrough) |
+**Why it didn't work:** alpine 3.21's apk-built ffmpeg lists every one
+of those libraries as a hard `NEEDED` entry in the ELF dynamic section
+of `/usr/bin/ffmpeg` and `libavcodec.so` itself. They're loaded at
+process startup by the dynamic linker, regardless of which codec
+paths the program ever takes. Removing them produced
 
-ffmpeg's core (`libavcodec`, `libavformat`, `libavfilter`, `libswresample`,
-`libswscale`, `libavutil`) loads these via `dlopen()` on demand; if an
-audio-only code path is taken, the missing libs are never opened. Total
-projected savings: **~44 MB**.
+```
+Error loading shared library libpostproc.so.57: No such file or directory
+    (needed by /usr/bin/ffmpeg)
+Error loading shared library libdrm.so.2: No such file or directory
+    (needed by /usr/lib/libavdevice.so.60)
+```
 
-`libwebp` is kept — small (480 KB) and used for cover-art format conversion
-in some audiobook libraries.
+at the first invocation of `ffmpeg`. `ldd /usr/bin/ffmpeg` confirms all
+of them are direct deps. There is no audio-only build of ffmpeg in
+Alpine's package repos.
+
+**Side observation that mattered for iter 2:** even though the broken
+image's `:latest` tag pointed to a runtime with the libs deleted, the
+on-host image size was **still 252 MB** — identical to iter 1. Reason:
+docker layers are immutable. The original `apk add ffmpeg` layer still
+contains all those `.so` bytes; the subsequent `RUN rm` only writes
+whiteout entries that hide them in the union view. The previous-layer
+bytes still ship in the image. To actually shrink, the prune has to
+happen in the **same RUN** as the install. Iter 2 corrects this layer
+structure so any future in-layer prune actually reduces size.
+
+**Carry-forward to future iters:** the ffmpeg slim path requires either
+a custom-compiled ffmpeg (`./configure --disable-everything
+--enable-decoder=mp3,aac,flac,opus,vorbis,…`) or replacing `apk add
+ffmpeg` with a static minimal binary. Both add CI complexity and risk
+to be evaluated separately if 252 MB is judged insufficient.
+
+### Iter 2 — combine layers + prune docs/man/locale
+
+Functional fixes from the iter 2a postmortem, plus small in-layer prunes
+for free wins.
+
+- All `apk add` + adduser + rm steps are now a single RUN, so any future
+  same-layer pruning will actually reduce image size.
+- Pruned in-layer: `/usr/share/man`, `/usr/share/doc`, `/usr/share/info`,
+  `/usr/share/X11`, `/usr/share/locale`, `/var/cache/apk/*`.
+
+Expected delta is small (~2-4 MB) — these directories aren't huge in a
+minimal alpine, but they're free wins and the corrected layer structure
+is the load-bearing change.
 
 ## Deployment
 

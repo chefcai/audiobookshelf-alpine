@@ -109,40 +109,38 @@ ARG NUSQLITE3_PATH
 # Runtime UID/GID = 13001 / 13000 — homelab convention (PUID/PGID) used by
 # sonarr/radarr/jellyfin/seerr-alpine. All bind-mounted dirs on squirttle
 # are owned by this UID/GID; mismatch causes EACCES at first start.
+# Single RUN combining apk install + user setup + tiny housekeeping prunes.
+# Why one RUN: docker layers are immutable, so a `rm` in a *later* layer
+# only writes a whiteout — the bytes still occupy space in the prior layer.
+# Any pruning has to happen in the same layer as the install to actually
+# shrink the image.
+#
+# Pruned in-layer (small but free):
+#   /usr/share/man, /usr/share/doc, /usr/share/info — apk's --no-cache
+#       cleans the package cache but doesn't touch installed docs/manpages.
+#       For a server image, these are dead weight (~2-4 MB).
+#   /usr/share/X11, /usr/share/locale: no GUI, server uses TZ env not locale.
+#
+# NOTE: a previous attempt removed ffmpeg's transitive video-codec libs
+# (libx264, libx265, libvpx, libaom, librav1e, libSvtAv1Enc, libdav1d,
+# libtheora*, libpostproc, libvulkan, libdrm*, libva*) on the assumption
+# that libavcodec dlopens them lazily and an audio-only runtime never
+# would. WRONG: alpine 3.21's apk-built ffmpeg lists every one of these
+# as a hard `NEEDED` ELF dep on /usr/bin/ffmpeg and on libavcodec.so —
+# they're loaded at process startup regardless of which codec paths are
+# taken, so removing any of them breaks ffmpeg with
+# "Error loading shared library lib<x>.so.<ver>: No such file or directory".
+# Documented in the README iteration log so future-us doesn't retry it.
 RUN apk add --no-cache \
         nodejs-current \
         ffmpeg \
         tini \
         tzdata \
  && addgroup -g 13000 abs \
- && adduser -D -u 13001 -G abs abs
-
-# Iter 2: drop ffmpeg's transitive video-codec libraries that an audio-only
-# server never invokes. Sizes from `du` on iter 1's image (alpine 3.21 ffmpeg):
-#   libx265 18.8M, libaom 7.4M, libSvtAv1Enc 6.5M, libvpx 3.2M, libx264 2.2M,
-#   librav1e 2.2M, libdav1d 1.6M, libtheora* 0.6M, libpostproc 84K
-# plus HW-accel stubs (libdrm*, libva*, libvulkan ~1.4M total) which are useless
-# without a passthrough device anyway.
-#
-# ffmpeg's libav* core libs (avcodec, avformat, avutil, avfilter, swresample,
-# swscale) load codec providers via dlopen; if a removed lib is referenced by
-# a code path the runtime never enters (any video-encode operation), the
-# request fails with "library not found" instead of crashing the binary.
-# Audiobookshelf only ever transcodes audio, so this is safe.
-#
-# Kept on purpose:
-#   libwebp       — cover-art format support (small ABS libraries embed webp art)
-#   libavfilter   — required for any ffmpeg filter graph (incl. audio resampling)
-RUN cd /usr/lib && \
-    rm -f \
-        libx264.so* libx265.so* \
-        libvpx.so* \
-        libtheora.so* libtheoraenc.so* libtheoradec.so* \
-        libaom.so* librav1e.so* libSvtAv1Enc.so* libdav1d.so* \
-        libpostproc.so* \
-        libvulkan.so* \
-        libdrm.so* libdrm_*.so* \
-        libva.so* libva-drm.so* libva-x11.so* libva-wayland.so*
+ && adduser -D -u 13001 -G abs abs \
+ && rm -rf /usr/share/man /usr/share/doc /usr/share/info \
+           /usr/share/X11 /usr/share/locale \
+           /var/cache/apk/*
 
 WORKDIR /app
 
