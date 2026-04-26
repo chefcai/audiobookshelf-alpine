@@ -30,7 +30,7 @@ ghcr.io/chefcai/audiobookshelf-alpine:<upstream-tag>   # e.g., v2.33.2
 | | Size | Δ vs upstream |
 |---|---:|---:|
 | `ghcr.io/advplyr/audiobookshelf:latest` (upstream) | **320 MB** | — |
-| `ghcr.io/chefcai/audiobookshelf-alpine:latest` | _measuring…_ | _measuring…_ |
+| `ghcr.io/chefcai/audiobookshelf-alpine:latest` (iter 2) | _measuring…_ | _measuring…_ |
 
 (Sizes here are reported uncompressed by `docker images` — i.e., what the
 image occupies on the host's filesystem after pull. The CI workflow logs
@@ -73,28 +73,57 @@ none of the build-time weight or non-target arch binaries.
 | Iter | Change | Image size | Δ vs prev | Δ vs upstream |
 |---:|---|---:|---:|---:|
 | 0 | upstream `ghcr.io/advplyr/audiobookshelf:latest` | 320 MB | — | — |
-| 1 | _building…_ | _measuring…_ | _measuring…_ | _measuring…_ |
+| 1 | multi-stage + prod-only re-install + alpine runtime + native/cruft prune | **252 MB** | **−68 MB** | **−68 MB (−21.3 %)** |
+| 2 | strip ffmpeg video-codec libs + HW-accel stubs (audio-only runtime) | _measuring…_ | _measuring…_ | _measuring…_ |
 
-(The iteration log will be updated in-place with each commit. Each row corresponds
+(The iteration log is updated in-place with each commit. Each row corresponds
 to one Dockerfile change pushed to `main`; the size column is the uncompressed
 on-host size as reported by `docker images`.)
 
-### Iter 1 — multi-stage + prod-only re-install + alpine runtime base
+### Iter 1 — multi-stage + prod-only re-install + alpine runtime base — 252 MB
 
 Adopt the seerr-alpine playbook end-to-end. Three stages: build-client (Nuxt
 generate), build-server (`npm ci --omit=dev --ignore-scripts` + `npm rebuild
 sqlite3` + nusqlite3 fetch + node_modules prune), runtime (`alpine:3.21` +
 apk `nodejs-current` + apk `ffmpeg` + apk `tini` + apk `tzdata`).
 
-Expected wins versus upstream's already-multi-stage `node:20-alpine` runtime base:
+Wins versus upstream's already-multi-stage `node:20-alpine` runtime base:
 
-- ~75 MB from swapping `node:20-alpine` → `alpine:3.21 + nodejs-current`
-- ~5-10 MB from dropping non-musl-x64 sqlite3 prebuilds
-- ~5-10 MB from `*.d.ts` / `*.map` / docs / tests stripping in `node_modules`
+- swapping `node:20-alpine` → `alpine:3.21 + nodejs-current` is the dominant
+  contribution (~127 MB → ~50 MB on the runtime base layer)
+- dropping non-musl-x64 sqlite3 prebuilds + `*.d.ts` / `*.map` / docs / tests
+  in `node_modules` accounts for the rest
 
-ffmpeg slimming is deferred to a later iter — that's where the bulk of remaining
-headroom lives, and it requires runtime smoke-testing of the audio transcoding
-paths before stripping codecs/filters.
+The 21 % shave from this iter alone covers the headroom most easily attacked
+without runtime smoke-testing. ffmpeg slimming is the next big lever and gets
+its own iter so the diff is bisectable if anything regresses.
+
+### Iter 2 — strip ffmpeg video-codec libs + HW-accel stubs
+
+Audiobookshelf only ever transcodes audio (HLS audio streaming, cover-art
+extraction, chapter timing). Apk's `ffmpeg` package pulls in a lot of video
+codec providers via shared deps that the audio runtime never invokes:
+
+| Library | Size | Purpose | Audio-only need? |
+|---|---:|---|---|
+| `libx265.so` | 18.8 MB | H.265 video encoder | No |
+| `libaom.so` | 7.4 MB | AV1 video encoder | No |
+| `libSvtAv1Enc.so` | 6.5 MB | AV1 video encoder | No |
+| `libvpx.so` | 3.2 MB | VP8/VP9 video encoder | No |
+| `libx264.so` | 2.2 MB | H.264 video encoder | No |
+| `librav1e.so` | 2.2 MB | AV1 video encoder | No |
+| `libdav1d.so` | 1.6 MB | AV1 video decoder | No |
+| `libtheora*.so` | 0.6 MB | Theora video codec | No |
+| `libpostproc.so` | 84 KB | Video post-processing | No |
+| `libvulkan.so` + `libdrm*.so` + `libva*.so` | ~1.4 MB | Hardware accel | No (no `--device` passthrough) |
+
+ffmpeg's core (`libavcodec`, `libavformat`, `libavfilter`, `libswresample`,
+`libswscale`, `libavutil`) loads these via `dlopen()` on demand; if an
+audio-only code path is taken, the missing libs are never opened. Total
+projected savings: **~44 MB**.
+
+`libwebp` is kept — small (480 KB) and used for cover-art format conversion
+in some audiobook libraries.
 
 ## Deployment
 

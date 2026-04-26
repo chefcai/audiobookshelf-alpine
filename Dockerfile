@@ -117,6 +117,33 @@ RUN apk add --no-cache \
  && addgroup -g 13000 abs \
  && adduser -D -u 13001 -G abs abs
 
+# Iter 2: drop ffmpeg's transitive video-codec libraries that an audio-only
+# server never invokes. Sizes from `du` on iter 1's image (alpine 3.21 ffmpeg):
+#   libx265 18.8M, libaom 7.4M, libSvtAv1Enc 6.5M, libvpx 3.2M, libx264 2.2M,
+#   librav1e 2.2M, libdav1d 1.6M, libtheora* 0.6M, libpostproc 84K
+# plus HW-accel stubs (libdrm*, libva*, libvulkan ~1.4M total) which are useless
+# without a passthrough device anyway.
+#
+# ffmpeg's libav* core libs (avcodec, avformat, avutil, avfilter, swresample,
+# swscale) load codec providers via dlopen; if a removed lib is referenced by
+# a code path the runtime never enters (any video-encode operation), the
+# request fails with "library not found" instead of crashing the binary.
+# Audiobookshelf only ever transcodes audio, so this is safe.
+#
+# Kept on purpose:
+#   libwebp       — cover-art format support (small ABS libraries embed webp art)
+#   libavfilter   — required for any ffmpeg filter graph (incl. audio resampling)
+RUN cd /usr/lib && \
+    rm -f \
+        libx264.so* libx265.so* \
+        libvpx.so* \
+        libtheora.so* libtheoraenc.so* libtheoradec.so* \
+        libaom.so* librav1e.so* libSvtAv1Enc.so* libdav1d.so* \
+        libpostproc.so* \
+        libvulkan.so* \
+        libdrm.so* libdrm_*.so* \
+        libva.so* libva-drm.so* libva-x11.so* libva-wayland.so*
+
 WORKDIR /app
 
 COPY --from=build-client --chown=abs:abs /src/client/dist /app/client/dist

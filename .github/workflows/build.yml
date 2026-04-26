@@ -100,17 +100,38 @@ jobs:
 
       - name: Report image size
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        continue-on-error: true
         run: |
-          # Pull the image we just pushed (manifest only) and report its
-          # uncompressed size from the manifest. Useful for tracking the
-          # iteration log in README.md without pulling the full image.
+          # Pull the image manifest we just pushed and report compressed size.
+          # buildx pushes an OCI image index (multi-arch + attestation), so we
+          # accept BOTH index and manifest media types and walk the index if
+          # we get one. There's also a propagation race after push — the
+          # manifest may 404 for a few seconds after the build step exits,
+          # so we retry briefly.
           VERSION="${{ steps.abs_version.outputs.version }}"
           TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
-          MANIFEST=$(curl -fsSL \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-            "https://ghcr.io/v2/${{ github.repository }}/manifests/$VERSION")
-          TOTAL=$(echo "$MANIFEST" | jq '[.layers[].size] | add')
+          ACCEPT="-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.oci.image.manifest.v1+json -H Accept:application/vnd.docker.distribution.manifest.v2+json"
+          MANIFEST=""
+          for i in 1 2 3 4 5; do
+            MANIFEST=$(curl -fsSL -H "Authorization: Bearer $TOKEN" $ACCEPT \
+              "https://ghcr.io/v2/${{ github.repository }}/manifests/$VERSION") && break
+            echo "manifest fetch attempt $i failed, retrying in 5s…"
+            sleep 5
+          done
+          if [ -z "$MANIFEST" ]; then
+            echo "::warning::Could not fetch manifest for ${IMAGE_NAME}:${VERSION} after 5 retries"
+            exit 0
+          fi
+          MEDIATYPE=$(echo "$MANIFEST" | jq -r '.mediaType // ""')
+          # If we got an index, pick the linux/amd64 manifest digest and refetch.
+          if echo "$MEDIATYPE" | grep -qE 'index|manifest.list'; then
+            DIGEST=$(echo "$MANIFEST" | jq -r '.manifests[]
+              | select(.platform.os=="linux" and .platform.architecture=="amd64" and (.platform["variant"]==null))
+              | .digest' | head -1)
+            MANIFEST=$(curl -fsSL -H "Authorization: Bearer $TOKEN" $ACCEPT \
+              "https://ghcr.io/v2/${{ github.repository }}/manifests/$DIGEST")
+          fi
+          TOTAL=$(echo "$MANIFEST" | jq '[.layers[]?.size] | add // 0')
           MB=$(awk "BEGIN {printf \"%.1f\", $TOTAL/1024/1024}")
-          echo "::notice::Image $IMAGE_NAME:$VERSION compressed layer total = ${MB} MB"
+          echo "::notice::${IMAGE_NAME}:${VERSION} compressed layer total = ${MB} MB"
           echo "compressed_mb=$MB" >> $GITHUB_OUTPUT
