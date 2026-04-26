@@ -1,0 +1,116 @@
+name: Build and Push audiobookshelf-alpine Image
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+  schedule:
+    # Daily at 07:45 UTC (staggered after seerr-alpine 06:45, ttyd 06:30,
+    # jellyfin 06:15, bazarr 06:00). Skips automatically if the upstream
+    # release tag is already published — see "Check if image already exists".
+    - cron: '45 7 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# Serialize runs on this ref. Without this, two back-to-back pushes can race
+# and the slower-finishing run overwrites :latest with stale bits — same
+# bug that bit chefcai/seerr-alpine on 2026-04-25 between iter 9 and iter 10.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Audiobookshelf version from upstream release
+        id: abs_version
+        run: |
+          VERSION=$(curl -fsSL "https://api.github.com/repos/advplyr/audiobookshelf/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not resolve upstream Audiobookshelf release tag"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Audiobookshelf version: $VERSION"
+
+      - name: Check if image already exists for this version
+        id: check
+        run: |
+          VERSION="${{ steps.abs_version.outputs.version }}"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
+          HTTP=$(curl -sSL -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${{ github.repository }}/manifests/$VERSION")
+          if [ "$HTTP" = "200" ]; then
+            echo "needs_build=false" >> $GITHUB_OUTPUT
+            echo "::notice::Version $VERSION already published — skipping build."
+          else
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "::notice::Version $VERSION not yet published (HTTP $HTTP) — will build."
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.abs_version.outputs.version }}
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            ABS_REF=${{ steps.abs_version.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report image size
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        run: |
+          # Pull the image we just pushed (manifest only) and report its
+          # uncompressed size from the manifest. Useful for tracking the
+          # iteration log in README.md without pulling the full image.
+          VERSION="${{ steps.abs_version.outputs.version }}"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
+          MANIFEST=$(curl -fsSL \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${{ github.repository }}/manifests/$VERSION")
+          TOTAL=$(echo "$MANIFEST" | jq '[.layers[].size] | add')
+          MB=$(awk "BEGIN {printf \"%.1f\", $TOTAL/1024/1024}")
+          echo "::notice::Image $IMAGE_NAME:$VERSION compressed layer total = ${MB} MB"
+          echo "compressed_mb=$MB" >> $GITHUB_OUTPUT
