@@ -91,11 +91,22 @@ RUN set -e; \
 #   - *.map: source maps, only useful with a debugger attached.
 #   - *.md / docs / examples / test / __tests__: documentation + tests.
 #   - CHANGELOG / .eslintrc / .prettierrc / tsconfig.json: build-time config.
+#
+# Iter 3: also drop build-time-only npm packages that npm's --omit=dev
+# leaves in node_modules because sqlite3's runtime dep graph references
+# them as `dependencies` (not `devDependencies`). They're only consulted
+# when re-compiling the native binding from source — which we already did
+# above in this same stage with `npm rebuild sqlite3`. After that, the
+# .node binary is in lib/binding/ and these packages are dead weight.
+#   - node-gyp        ~2.1 MB  — Python/C++ build orchestrator
+#   - node-addon-api  ~416 KB  — header-only NAPI helper, compile-time only
+#   - .cache          —         npm/node-gyp build cache leftovers
 RUN set -e; \
     cd node_modules; \
     find . \( -name '*.md' -o -name '*.markdown' -o -name '*.map' -o -name '*.d.ts' -o -name '*.d.ts.map' \) -type f -delete; \
     find . -type d \( -name 'docs' -o -name 'doc' -o -name 'examples' -o -name 'example' -o -name '__tests__' -o -name 'test' -o -name 'tests' \) -prune -exec rm -rf {} +; \
     find . -type f \( -name 'CHANGELOG*' -o -name 'HISTORY*' -o -name 'AUTHORS' -o -name 'CONTRIBUTORS' -o -name '.travis.yml' -o -name '.eslintrc*' -o -name '.prettierrc*' -o -name 'tsconfig.json' \) -delete; \
+    rm -rf node-gyp node-addon-api .cache; \
     true
 
 # ---- Stage 3: runtime -----------------------------------------------------

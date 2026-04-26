@@ -75,7 +75,8 @@ none of the build-time weight or non-target arch binaries.
 | 0 | upstream `ghcr.io/advplyr/audiobookshelf:latest` | 320 MB | — | — |
 | 1 | multi-stage + prod-only re-install + alpine runtime + native/cruft prune | **252 MB** | **−68 MB** | **−68 MB (−21.3 %)** |
 | 2a | _attempted_ strip ffmpeg video-codec libs + HW-accel stubs | _broke ffmpeg_ | — | — |
-| 2 | combine apk-add+prune into single RUN; drop man/doc/locale | _measuring…_ | _measuring…_ | _measuring…_ |
+| 2 | combine apk-add+prune into single RUN; drop man/doc/locale | **251 MB** | **−1 MB** | **−69 MB (−21.6 %)** |
+| 3 | drop build-only `node-gyp` + `node-addon-api` from prod node_modules | _measuring…_ | _measuring…_ | _measuring…_ |
 
 (The iteration log is updated in-place with each commit. Each row corresponds
 to one Dockerfile change pushed to `main`; the size column is the uncompressed
@@ -142,7 +143,7 @@ a custom-compiled ffmpeg (`./configure --disable-everything
 ffmpeg` with a static minimal binary. Both add CI complexity and risk
 to be evaluated separately if 252 MB is judged insufficient.
 
-### Iter 2 — combine layers + prune docs/man/locale
+### Iter 2 — combine layers + prune docs/man/locale — 251 MB
 
 Functional fixes from the iter 2a postmortem, plus small in-layer prunes
 for free wins.
@@ -152,9 +153,46 @@ for free wins.
 - Pruned in-layer: `/usr/share/man`, `/usr/share/doc`, `/usr/share/info`,
   `/usr/share/X11`, `/usr/share/locale`, `/var/cache/apk/*`.
 
-Expected delta is small (~2-4 MB) — these directories aren't huge in a
-minimal alpine, but they're free wins and the corrected layer structure
-is the load-bearing change.
+Net: 1 MB reduction. The directories aren't huge in a minimal alpine, but
+the corrected layer structure is the load-bearing change for any future
+same-layer prune to actually shrink. Image boots cleanly, ffmpeg/ffprobe
+work, ABS reaches `[Server] Init v2.33.2` and database init.
+
+### Iter 3 — drop build-only npm packages from prod node_modules
+
+`npm install --omit=dev` correctly skips the top-level devDependencies,
+but `sqlite3` lists `node-gyp` and `node-addon-api` as runtime
+`dependencies` so the resolver keeps them in the prod tree even though
+they're only consulted when recompiling the native binding from source.
+
+We already do `npm rebuild sqlite3` in the same stage, after which the
+compiled `.node` binary lives in `node_modules/sqlite3/lib/binding/` and
+neither `node-gyp` nor `node-addon-api` is ever loaded by the runtime.
+Drop them.
+
+| Package | Size | Reason it's safe to drop |
+|---|---:|---|
+| `node-gyp` | 2.1 MB | Compile-time orchestrator (Python + Make wrappers); only invoked by `npm rebuild`, which has already run. |
+| `node-addon-api` | 416 KB | Header-only NAPI helper; symbols are baked into the compiled `.node` after `npm rebuild`. |
+| `.cache` | varies | Build-tool scratch directory — never read at runtime. |
+
+Net expected: ~2.5 MB.
+
+### Plateau
+
+After iter 3, the remaining 248-ish MB is mostly:
+
+- `/usr/bin/node` — 61.7 MB, apk-stripped already
+- `/usr/lib/lib*.so` — ~85 MB of ffmpeg deps that `ldd` shows are NEEDED
+  at process startup (see iter 2a). Slimming any further requires
+  building ffmpeg from source with codec subsetting, which is out of
+  scope for this repo.
+- `/app` — ~55 MB of ABS server source + production node_modules. The
+  big-ticket items there (`moment` 4.6 MB, `lodash` 4.9 MB, `sqlite3`
+  5.4 MB, `moment-timezone` 2.9 MB) are all runtime-essential.
+
+Further iterations would yield <1 MB each — diminishing returns. Iter 3
+is the last shrink pass.
 
 ## Deployment
 
