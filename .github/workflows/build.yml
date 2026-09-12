@@ -3,6 +3,8 @@ name: Build and Push audiobookshelf-alpine Image
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
   schedule:
     # Daily at 07:45 UTC (staggered after seerr-alpine 06:45, ttyd 06:30,
@@ -90,7 +92,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           build-args: |
             ABS_REF=${{ steps.abs_version.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -99,7 +101,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Report image size
-        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true')
         continue-on-error: true
         run: |
           # Pull the image manifest we just pushed and report compressed size.

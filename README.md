@@ -7,8 +7,8 @@ Same pattern as [`chefcai/seerr-alpine`](https://github.com/chefcai/seerr-alpine
 [`chefcai/jellyfin-alpine`](https://github.com/chefcai/jellyfin-alpine),
 [`chefcai/ttyd-alpine`](https://github.com/chefcai/ttyd-alpine), and
 [`chefcai/bazarr-alpine`](https://github.com/chefcai/bazarr-alpine): the image is
-assembled in GitHub Actions and published to `ghcr.io`, so the eMMC-bound homelab
-host (`squirttle`) never holds intermediate build artifacts.
+assembled in GitHub Actions and published to `ghcr.io`, so small/resource-constrained
+homelab hosts never hold intermediate build artifacts.
 
 ## Upstream tracking
 
@@ -38,7 +38,7 @@ the compressed manifest size as a sanity-check.)
 
 ## Why
 
-`squirttle` (Wyse 5020) has only ~12 GB of eMMC and no expansion path. Audiobookshelf
+Many homelab hosts run with a small amount of storage and no expansion path. Audiobookshelf
 upstream is already multi-stage and reasonably tight, but several lines remain on the
 table:
 
@@ -61,9 +61,9 @@ Multi-stage Dockerfile:
    --ignore-scripts`, `npm rebuild sqlite3`, fetch `libnusqlite3.so` for
    `linux-musl-x64`, then strip arch-specific sqlite3 prebuilds + `*.d.ts` /
    `*.map` / `*.md` / `docs/` / `test/` / `examples/` from `node_modules`.
-3. **Runtime** (`alpine:3.21`): `apk add nodejs-current ffmpeg tini tzdata`, copy
-   only the runtime artifacts from the prior stages, drop privileges to UID
-   13001 / GID 13000 (homelab-wide PUID/PGID convention).
+3. **Runtime** (`alpine:3.21`): `apk add nodejs-current ffmpeg tini tzdata su-exec`,
+   copy only the runtime artifacts from the prior stages; `entrypoint.sh` drops
+   privileges to `PUID`/`PGID` (default 1000:1000) at container start.
 
 Net effect: same `node index.js` entrypoint, same upstream release SHA,
 none of the build-time weight or non-target arch binaries.
@@ -197,7 +197,7 @@ is the last shrink pass.
 
 ## Deployment
 
-In `~/arrs/docker-compose.yml` on squirttle, side-by-side with the existing
+In your `docker-compose.yml`, side-by-side with the existing
 upstream-image-based `audiobookshelf` service while validating:
 
 ```yaml
@@ -210,7 +210,7 @@ audiobookshelf-alpine:
       max-size: "10m"
       max-file: "3"
   environment:
-    - TZ=America/New_York
+    - TZ=UTC  # override to your local zone
   healthcheck:
     test: ["CMD", "wget", "-qO-", "http://localhost:80/healthcheck"]
     interval: 1m30s
@@ -221,7 +221,7 @@ audiobookshelf-alpine:
   volumes:
     # Distinct host paths from the upstream-image install so a config
     # corruption in one doesn't bleed into the other.
-    - /home/haadmin/config/audiobookshelf-alpine-config:/config
+    - /path/to/audiobookshelf-alpine-config:/config
     - /mnt/Media/data/media/audiobooks:/audiobooks:ro
     - /mnt/Media/data/media/podcasts:/podcasts:ro
     - /mnt/Media/config/audiobookshelf-alpine/metadata:/metadata
@@ -234,7 +234,7 @@ The library mounts are read-only during validation — Audiobookshelf can write
 metadata back into source files when "Embed metadata" is enabled, and we don't
 want this validation install touching the production library.
 
-After first start, the host paths must be `chown -R 13001:13000` to match the
+After first start, the host paths must be `chown -R 1000:1000` to match the
 container's UID/GID, or the runtime will EACCES on `/config/`.
 
 ## Bootstrap notes

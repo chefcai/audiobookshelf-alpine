@@ -1,7 +1,7 @@
 # audiobookshelf-alpine — minimal Docker image of Audiobookshelf on Alpine
 #
 # Pattern mirrors chefcai/seerr-alpine and chefcai/jellyfin-alpine:
-#   - Build happens in GitHub Actions, not on squirttle's eMMC.
+#   - Build happens in GitHub Actions, not on the deploying host.
 #   - Final image is alpine:3.21 + apk nodejs-current + apk ffmpeg + the
 #     runtime artifacts needed by `node index.js`.
 #
@@ -60,7 +60,7 @@ RUN git clone --depth 1 --branch "${ABS_REF}" "${ABS_REPO}" /src \
 
 # nusqlite3 is a C library bundled at runtime for SQLite Unicode collation.
 # Upstream downloads it from a GitHub release per arch; this build is amd64-only
-# (matches squirttle), so we fetch the linux-musl-x64 build unconditionally.
+# so we fetch the linux-musl-x64 build unconditionally (amd64-only for now).
 RUN curl -fL -o /tmp/nusqlite3.zip \
         "https://github.com/mikiher/nunicode-sqlite/releases/download/${NUSQLITE3_VERSION}/libnusqlite3-linux-musl-x64.zip" \
  && unzip -q /tmp/nusqlite3.zip -d "${NUSQLITE3_DIR}" \
@@ -77,12 +77,14 @@ RUN npm ci --omit=dev --ignore-scripts \
 # Drop arch-specific sqlite3 prebuilds. sqlite3@5.x ships prebuilt .node
 # binaries for darwin/win/linux-glibc/etc. that the runtime never loads on
 # musl/x64. Saves ~5-10 MB.
+# NOTE: arm64 prebuild pruned too -- nusqlite3 (fetched above) is amd64-only,
+# so an arm64 build would break at runtime even with sqlite3's binding present.
+# See https://github.com/chefcai/audiobookshelf-alpine/issues/3
 RUN set -e; \
     cd node_modules/sqlite3/lib/binding 2>/dev/null && \
     ls 1>/dev/null 2>&1 && { \
       find . -maxdepth 1 -mindepth 1 -type d \
         ! -name 'napi-v6-linux-musl-x64' \
-        ! -name 'napi-v6-linux-musl-arm64' \
         -prune -exec rm -rf {} +; \
     } || true
 
@@ -117,9 +119,10 @@ FROM alpine:3.21
 ARG NUSQLITE3_DIR
 ARG NUSQLITE3_PATH
 
-# Runtime UID/GID = 13001 / 13000 — homelab convention (PUID/PGID) used by
-# sonarr/radarr/jellyfin/seerr-alpine. All bind-mounted dirs on squirttle
-# are owned by this UID/GID; mismatch causes EACCES at first start.
+# UID/GID 13001:13000 by default at build time (homelab convention, matches
+# sonarr/radarr/jellyfin/seerr-alpine) -- fully overridable at runtime via
+# the PUID/PGID env vars, see entrypoint.sh and
+# https://github.com/chefcai/audiobookshelf-alpine/issues/1
 # Single RUN combining apk install + user setup + tiny housekeeping prunes.
 # Why one RUN: docker layers are immutable, so a `rm` in a *later* layer
 # only writes a whiteout — the bytes still occupy space in the prior layer.
@@ -147,6 +150,7 @@ RUN apk add --no-cache \
         ffmpeg \
         tini \
         tzdata \
+        su-exec \
  && addgroup -g 13000 abs \
  && adduser -D -u 13001 -G abs abs \
  && rm -rf /usr/share/man /usr/share/doc /usr/share/info \
@@ -162,7 +166,12 @@ COPY --from=build-server --chown=abs:abs ${NUSQLITE3_PATH} ${NUSQLITE3_PATH}
 RUN mkdir -p /config /metadata /audiobooks /podcasts \
  && chown -R abs:abs /config /metadata /app
 
-USER abs
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# NOTE: intentionally stays as root here -- entrypoint.sh drops to
+# PUID:PGID (default 1000:1000) via su-exec at container start. See
+# https://github.com/chefcai/audiobookshelf-alpine/issues/1
 
 EXPOSE 80
 
@@ -174,5 +183,5 @@ ENV SOURCE=docker
 ENV NUSQLITE3_DIR=${NUSQLITE3_DIR}
 ENV NUSQLITE3_PATH=${NUSQLITE3_PATH}
 
-ENTRYPOINT ["tini", "--"]
+ENTRYPOINT ["tini", "--", "/entrypoint.sh"]
 CMD ["node", "index.js"]
