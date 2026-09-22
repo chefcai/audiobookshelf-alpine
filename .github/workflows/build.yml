@@ -77,9 +77,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Only the default branch publishes :latest and :<version>.
+          # Any other branch (workflow_dispatch --ref <branch>) publishes
+          # :branch-<name> so test builds can never overwrite production tags.
           tags: |
-            type=raw,value=latest
-            type=raw,value=${{ steps.abs_version.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.abs_version.outputs.version }},enable={{is_default_branch}}
+            type=ref,event=branch,prefix=branch-,enable=${{ github.ref_name != 'main' }}
 
       - name: Set up Docker Buildx
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
