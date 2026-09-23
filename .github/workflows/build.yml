@@ -132,9 +132,19 @@ jobs:
       - name: Smoke test image
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
         run: |
-          TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
-          echo "Smoke-testing $TAG"
-          docker run --rm --entrypoint sh "$TAG" -c '
+          # Prefer the build step's imageid: it is always populated (even on
+          # pull_request events, where the tags template above intentionally
+          # produces no tag since PR builds aren't pushed or promoted).
+          IMAGE="${{ steps.build.outputs.imageid }}"
+          if [ -z "$IMAGE" ]; then
+            IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          fi
+          if [ -z "$IMAGE" ]; then
+            echo "::error::No image id or tag available to smoke test"
+            exit 1
+          fi
+          echo "Smoke-testing $IMAGE"
+          docker run --rm --entrypoint sh "$IMAGE" -c '
             set -e
             echo "--- node --version ---"; node --version
             echo "--- ffmpeg -version ---"; ffmpeg -version | head -1
