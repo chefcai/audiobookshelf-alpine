@@ -2,8 +2,8 @@
 #
 # Pattern mirrors chefcai/seerr-alpine and chefcai/jellyfin-alpine:
 #   - Build happens in GitHub Actions, not on the deploying host.
-#   - Final image is alpine:3.21 + apk nodejs-current + apk ffmpeg + the
-#     runtime artifacts needed by `node index.js`.
+#   - Final image is alpine:3.21 + apk nodejs (LTS) + a slim static
+#     ffmpeg/ffprobe + the runtime artifacts needed by `node index.js`.
 #
 # Baseline (upstream): ghcr.io/advplyr/audiobookshelf:latest = 320 MB
 # Target: ≥40 % reduction. Biggest single lever is swapping node:20-alpine
@@ -111,10 +111,58 @@ RUN set -e; \
     rm -rf node-gyp node-addon-api .cache; \
     true
 
+# ---- Stage 2b: slim static ffmpeg/ffprobe ---------------------------------
+# Alpine's `ffmpeg` apk hard-links every video codec lib (x264, x265, aom,
+# SVT-AV1, rav1e, dav1d, vpx, vulkan, libplacebo, ...) as NEEDED deps, and
+# they cannot be pruned after install (see the NOTE in the runtime stage).
+# Audiobookshelf only ever uses ffmpeg for:
+#   - probing audio files (ffprobe)
+#   - HLS streaming: `-c:a copy` or `-c:a aac`, `-f hls` (mpegts or fmp4)
+#   - m4b merge/encode: concat demuxer -> aac -> mp4/ipod
+#   - tag/chapter embedding: ffmetadata input + cover-art attached_pic
+#   - podcast download: node pipes the HTTP body into ffmpeg (pipe:),
+#     ffmpeg never opens a network URL itself
+#   - cover extraction (-map 0:v:0 -frames:v 1) and cover/author thumbnail
+#     resize (`-vf scale=W:H` to .webp/.jpeg/.png)
+# So we build ffmpeg with --disable-everything and enable only those
+# components, statically linked against musl + libwebp + zlib. Network
+# protocols are disabled on purpose.
+FROM alpine:3.21 AS build-ffmpeg
+ARG FFMPEG_VERSION=7.1.1
+RUN apk add --no-cache build-base nasm pkgconf curl xz \
+        zlib-dev zlib-static libwebp-dev libwebp-static
+WORKDIR /src
+RUN curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" | tar xJ --strip-components=1
+RUN ./configure \
+        --prefix=/opt/ffmpeg \
+        --pkg-config-flags=--static \
+        --extra-ldflags=-static \
+        --enable-static --disable-shared \
+        --disable-debug --disable-doc --disable-ffplay \
+        --disable-autodetect --disable-network \
+        --enable-zlib --enable-libwebp \
+        --disable-everything \
+        --enable-protocol=file,pipe \
+        --enable-demuxer=mov,mp3,aac,flac,ogg,wav,aiff,asf,matroska,ape,wv,ac3,eac3,concat,ffmetadata,image2,image_jpeg_pipe,image_png_pipe,image_webp_pipe,mjpeg \
+        --enable-muxer=mp4,ipod,mov,mp3,adts,flac,ogg,opus,wav,matroska,hls,mpegts,segment,ffmetadata,image2,mjpeg,webp,null \
+        --enable-decoder=aac,aac_latm,mp3,mp3float,mp2,flac,alac,vorbis,opus,ac3,eac3,ape,wavpack,wmav1,wmav2,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8,mjpeg,png,webp,gif,bmp \
+        --enable-encoder=aac,flac,pcm_s16le,mjpeg,png,libwebp \
+        --enable-parser=aac,aac_latm,mpegaudio,flac,opus,vorbis,ac3,mjpeg,png,webp \
+        --enable-bsf=aac_adtstoasc,extract_extradata,null \
+        --enable-filter=scale,format,null,anull,aresample,aformat,atrim,asetpts,setpts,pan,volume,concat,amix,apad,copy,acopy \
+        --enable-swscale --enable-swresample \
+ && make -j"$(nproc)" \
+ && make install \
+ && strip /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe \
+ && /opt/ffmpeg/bin/ffmpeg -hide_banner -version | head -1 \
+ && ! ldd /opt/ffmpeg/bin/ffmpeg 2>/dev/null | grep -q '=>'
+
 # ---- Stage 3: runtime -----------------------------------------------------
-# alpine:3.21 + nodejs-current (= node 22.x in 3.21) is ~50 MB lighter than
-# node:20-alpine. ffmpeg + tini + tzdata from apk; identical functional set
-# to upstream, just on a smaller base.
+# alpine:3.21 + `nodejs` (LTS, v22.x in 3.21). The previous `nodejs-current`
+# package is v23.x in 3.21 -- an odd-numbered, end-of-life Node release.
+# ffmpeg/ffprobe come from the slim static build stage above instead of apk.
+# alpine:3.21 is kept deliberately: the sonarr/radarr/prowlarr/bazarr images
+# use the same base, so the base layer is stored once on the host.
 FROM alpine:3.21
 ARG NUSQLITE3_DIR
 ARG NUSQLITE3_PATH
@@ -146,8 +194,7 @@ ARG NUSQLITE3_PATH
 # "Error loading shared library lib<x>.so.<ver>: No such file or directory".
 # Documented in the README iteration log so future-us doesn't retry it.
 RUN apk add --no-cache \
-        nodejs-current \
-        ffmpeg \
+        nodejs \
         tini \
         tzdata \
         su-exec \
@@ -162,6 +209,8 @@ WORKDIR /app
 COPY --from=build-client --chown=abs:abs /src/client/dist /app/client/dist
 COPY --from=build-server --chown=abs:abs /server          /app
 COPY --from=build-server --chown=abs:abs ${NUSQLITE3_PATH} ${NUSQLITE3_PATH}
+# Slim static ffmpeg/ffprobe (root-owned, on PATH for fluent-ffmpeg).
+COPY --from=build-ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
 
 RUN mkdir -p /config /metadata /audiobooks /podcasts \
  && chown -R abs:abs /config /metadata /app

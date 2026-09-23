@@ -25,12 +25,15 @@ ghcr.io/chefcai/audiobookshelf-alpine:latest
 ghcr.io/chefcai/audiobookshelf-alpine:<upstream-tag>   # e.g., v2.33.2
 ```
 
+Builds dispatched from a non-`main` branch (`gh workflow run build.yml --ref <branch>`)
+publish only `:branch-<branch-name>`; `:latest` and the version tag are published from `main` only.
+
 ## Result
 
 | | Size | Δ vs upstream |
 |---|---:|---:|
 | `ghcr.io/advplyr/audiobookshelf:latest` (upstream) | **320 MB** | — |
-| `ghcr.io/chefcai/audiobookshelf-alpine:latest` (iter 3) | **249 MB** | **−71 MB (−22.2 %)** |
+| `ghcr.io/chefcai/audiobookshelf-alpine:latest` (iter 4) | **127 MB** | **−193 MB (−60.3 %)** |
 
 (Sizes here are reported uncompressed by `docker images` — i.e., what the
 image occupies on the host's filesystem after pull. The CI workflow logs
@@ -43,13 +46,14 @@ upstream is already multi-stage and reasonably tight, but several lines remain o
 table:
 
 - the `node:20-alpine` base layer (~127 MB) versus alpine:3.21 + apk
-  `nodejs-current` (~50 MB)
+  `nodejs` (LTS)
 - arch-specific `sqlite3` prebuilds for darwin/win/linux-glibc that musl-x64 never
   loads
 - `*.d.ts`, `*.map`, `*.md`, `docs/`, `test/`, `examples/`, and lifecycle metadata
   in production `node_modules`
-- ffmpeg ships with codecs and tools the audio-server runtime never invokes (subject
-  to verification — see iteration log below)
+- Alpine's apk `ffmpeg` hard-links every video codec library; Audiobookshelf only
+  needs audio + cover-image handling, so a purpose-built static ffmpeg replaces it
+  (iteration 4)
 
 ## How it shrinks the image
 
@@ -61,9 +65,27 @@ Multi-stage Dockerfile:
    --ignore-scripts`, `npm rebuild sqlite3`, fetch `libnusqlite3.so` for
    `linux-musl-x64`, then strip arch-specific sqlite3 prebuilds + `*.d.ts` /
    `*.map` / `*.md` / `docs/` / `test/` / `examples/` from `node_modules`.
-3. **Runtime** (`alpine:3.21`): `apk add nodejs-current ffmpeg tini tzdata su-exec`,
-   copy only the runtime artifacts from the prior stages; `entrypoint.sh` drops
-   privileges to `PUID`/`PGID` (default 1000:1000) at container start.
+3. **Build ffmpeg** (`alpine:3.21`): static ffmpeg/ffprobe 7.1 configured with
+   `--disable-everything` plus only the components Audiobookshelf uses (see below).
+4. **Runtime** (`alpine:3.21`): `apk add nodejs tini tzdata su-exec`, copy the
+   runtime artifacts and the two static ffmpeg binaries (`/usr/local/bin`);
+   `entrypoint.sh` drops privileges to `PUID`/`PGID` (default 1000:1000) at
+   container start.
+
+### Slim ffmpeg: what is enabled and why
+
+| Audiobookshelf feature | ffmpeg components |
+|---|---|
+| Library scan / probe | `ffprobe`; demuxers mov (m4b/m4a/mp4), mp3, aac, flac, ogg, wav, aiff, asf, matroska, ape, wv, ac3/eac3 + matching decoders |
+| HLS streaming | `-c:a copy` or `-c:a aac`; muxers hls, mpegts, mp4 (fmp4 segments), adts |
+| m4b merge / encode | concat demuxer, aac encoder, mp4/ipod muxers |
+| Tag + chapter embedding | ffmetadata demuxer, attached-pic copy |
+| Podcast download | `pipe:` input only (node does the HTTP fetch) |
+| Cover extract / resize | mjpeg/png/webp/gif/bmp decoders, mjpeg/png/libwebp encoders, `scale` filter |
+
+Network protocols are disabled (`--disable-network`); ffmpeg only reads local
+files and pipes. To add a codec, append it to the relevant `--enable-*` list in
+the `build-ffmpeg` stage.
 
 Net effect: same `node index.js` entrypoint, same upstream release SHA,
 none of the build-time weight or non-target arch binaries.
@@ -78,6 +100,9 @@ none of the build-time weight or non-target arch binaries.
 | 2 | combine apk-add+prune into single RUN; drop man/doc/locale | **251 MB** | **−1 MB** | **−69 MB (−21.6 %)** |
 | 3 | drop build-only `node-gyp` + `node-addon-api` from prod node_modules | **249 MB** | **−2 MB** | **−71 MB (−22.2 %)** |
 | — | _plateau_ — remaining ~249 MB is dominated by stripped node binary (62 MB) + ffmpeg's NEEDED ELF deps (~85 MB), neither further reducible without a custom ffmpeg build. | | | |
+| 4 | replace apk `ffmpeg` with a slim static ffmpeg/ffprobe build stage; runtime `nodejs` (LTS 22) instead of `nodejs-current` (23, end-of-life) | **127 MB** | **−122 MB** | **−193 MB (−60.3 %)** |
+
+Iteration 4 compressed size: 88.2 MB → 46.2 MB.
 
 (The iteration log is updated in-place with each commit. Each row corresponds
 to one Dockerfile change pushed to `main`; the size column is the uncompressed
