@@ -11,10 +11,18 @@ on:
     # jellyfin 06:15, bazarr 06:00). Skips automatically if the upstream
     # release tag is already published — see "Check if image already exists".
     - cron: '45 7 * * *'
+    # Weekly forced base-image refresh, Sundays at 08:15 UTC. Ignores the
+    # "already published" skip so Alpine 3.21 apk security fixes land even
+    # when the app itself hasn't cut a new release (HOMELAB-91 finding:
+    # skip-if-version-published means base/apk fixes never land otherwise).
+    - cron: '15 8 * * 0'
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Weekly forced-refresh schedule expression, kept in one place so the
+  # "Check if image already exists" step can recognize it.
+  FORCE_REFRESH_CRON: '15 8 * * 0'
 
 # Serialize runs on this ref. Without this, two back-to-back pushes can race
 # and the slower-finishing run overwrites :latest with stale bits — same
@@ -32,7 +40,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Get Audiobookshelf version from upstream release
         id: abs_version
@@ -45,10 +53,26 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Audiobookshelf version: $VERSION"
 
+      - name: Check current pinned FFMPEG_VERSION against upstream 7.1.x point releases
+        continue-on-error: true
+        run: |
+          PINNED=$(grep -m1 '^ARG FFMPEG_VERSION=' Dockerfile | cut -d= -f2)
+          LATEST=$(curl -fsSL "https://api.github.com/repos/FFmpeg/FFmpeg/tags?per_page=30" \
+            | grep '"name": "n7\.1\.' | head -1 | cut -d'"' -f4 | sed 's/^n//')
+          echo "Pinned FFMPEG_VERSION: ${PINNED:-unknown}; latest 7.1.x tag upstream: ${LATEST:-unknown}"
+          if [ -n "$LATEST" ] && [ -n "$PINNED" ] && [ "$LATEST" != "$PINNED" ]; then
+            echo "::notice::ffmpeg ${PINNED} is pinned in Dockerfile but ${LATEST} is available. Consider bumping ARG FFMPEG_VERSION."
+          fi
+
       - name: Check if image already exists for this version
         id: check
         run: |
           VERSION="${{ steps.abs_version.outputs.version }}"
+          if [ "${{ github.event.schedule }}" = "${{ env.FORCE_REFRESH_CRON }}" ]; then
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "::notice::Weekly forced base-image refresh — rebuilding $VERSION regardless of publish state to pick up Alpine 3.21 security fixes."
+            exit 0
+          fi
           TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
           HTTP=$(curl -sSL -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer $TOKEN" \
@@ -65,7 +89,7 @@ jobs:
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -74,7 +98,7 @@ jobs:
       - name: Extract metadata for Docker
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # Only the default branch publishes :latest and :<version>.
@@ -87,22 +111,45 @@ jobs:
 
       - name: Set up Docker Buildx
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push Docker image
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
+          load: true
           build-args: |
             ABS_REF=${{ steps.abs_version.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Smoke test image
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        run: |
+          # Prefer the build step's imageid: it is always populated (even on
+          # pull_request events, where the tags template above intentionally
+          # produces no tag since PR builds aren't pushed or promoted).
+          IMAGE="${{ steps.build.outputs.imageid }}"
+          if [ -z "$IMAGE" ]; then
+            IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          fi
+          if [ -z "$IMAGE" ]; then
+            echo "::error::No image id or tag available to smoke test"
+            exit 1
+          fi
+          echo "Smoke-testing $IMAGE"
+          docker run --rm --entrypoint sh "$IMAGE" -c '
+            set -e
+            echo "--- node --version ---"; node --version
+            echo "--- ffmpeg -version ---"; ffmpeg -version | head -1
+            echo "--- ffprobe -version ---"; ffprobe -version | head -1
+          '
 
       - name: Report image size
         if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true')
